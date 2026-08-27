@@ -1,0 +1,56 @@
+[package]
+name = "bib"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "A bibliography manager with first-class Typst/hayagriva output"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+anyhow = "1"
+biblatex = "0.12"
+clap = { version = "4", features = ["derive", "wrap_help"] }
+deunicode = "1"
+directories = "6"
+figment = { version = "0.10", features = ["toml", "env"] }
+hayagriva = "0.10"
+humantime = "2"
+humantime-serde = "1"
+jiff = { version = "0.2", features = ["serde"] }
+minijinja = { version = "2", features = ["loader"] }
+quick-xml = "0.38"
+regex = "1"
+strsim = "0.11"
+# `bundled` compiles SQLite with cc, so there is no system libsqlite3 to link
+# against and the binary stays dependent only on libc.
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Pinned to hayagriva's YAML crate: one stack in the closure, and identical
+# parse semantics on both sides of the entry bridge.
+serde_yaml = "0.9"
+tempfile = "3"
+toml = "1"
+toml_edit = "0.25"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+unicode-ident = "1"
+unicode-normalization = "0.1"
+# Default features are rustls + webpki-roots: no openssl-sys, no pkg-config,
+# and no dependency on a system CA bundle. Blocking on purpose — see
+# `providers` for why an async runtime would be pure cost here.
+ureq = { version = "3", features = ["json"] }
+
+[profile.release]
+lto = "thin"
+strip = true
+
+[dev-dependencies]
+figment = { version = "0.10", features = ["toml", "env", "test"] }
+# Blocking-compatible mock HTTP server. `wiremock` is tokio-only, which is why
+# it was dropped along with the async design.
+httpmock = "0.8"
+# Re-declared: integration tests see only the crate plus dev-dependencies.
+rusqlite = { version = "0.37", features = ["bundled"] }
+tempfile = "3"
+unicode-normalization = "0.1"
