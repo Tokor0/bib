@@ -238,7 +238,7 @@ pub fn run(mut args: AddArgs, library: Option<&str>) -> Result<()> {
 
     // A failed fetch never fails the add: the metadata is the deliverable and
     // the document is a bonus that many records simply do not have.
-    if (args.fetch || loaded.config.fetch.auto) && doc.files().is_empty() {
+    if (args.fetch || loaded.config.fetch.auto) && doc.attachments().is_empty() {
         let http = resolve::http(&loaded.config, state.join("cache/http"), args.offline);
         match crate::cli::fetch_cmd::attach(&store, &http, &loaded.config, &doc, false) {
             Ok(Some(source)) => eprintln!("fetched {}", source.url),

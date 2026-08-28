@@ -5,13 +5,14 @@
 
 use crate::cli::{resolve, update};
 use crate::config::{self, Config};
-use crate::identify::patterns::Identifier;
+use crate::identify::patterns::{self, Identifier};
 use crate::model::Document;
 use crate::providers::Http;
 use crate::providers::fetch::{self, PdfSource};
 use crate::store::Store;
 use anyhow::{Result, bail};
 use clap::Args;
+use hayagriva::Entry;
 use std::path::PathBuf;
 
 #[derive(Debug, Args)]
@@ -41,7 +42,10 @@ pub fn run(args: FetchArgs, library: Option<&str>) -> Result<()> {
     let mut fetched = 0usize;
 
     for doc in &targets {
-        if !args.force && !doc.files().is_empty() {
+        // `attachments`, not `files`: a `files:` entry naming a file that is
+        // not on disk is exactly the document that needs fetching, and a papis
+        // import produces a library full of them.
+        if !args.force && !doc.attachments().is_empty() {
             eprintln!("{}: already has an attachment", doc.citekey);
             continue;
         }
@@ -71,19 +75,13 @@ pub fn attach(
     dry_run: bool,
 ) -> Result<Option<PdfSource>> {
     let entry = doc.entry()?;
-    let id = entry.doi().and_then(Identifier::parse_doi).or_else(|| {
-        entry
-            .arxiv()
-            .and_then(|a| crate::identify::patterns::normalize_arxiv(a).map(Identifier::ArXiv))
-    });
+    let arxiv = arxiv_of(&entry);
+    let url = entry.url().map(|u| u.value.to_string());
+    let oa_url = open_access_url(http, config, &entry, arxiv.is_some());
 
     let sources = allowed(
         config,
-        fetch::candidates(
-            id.as_ref(),
-            doc.meta().provenance.get("oa_url").map(String::as_str),
-            entry.url().map(|u| u.value.to_string()).as_deref(),
-        ),
+        fetch::candidates(arxiv.as_deref(), oa_url.as_deref(), url.as_deref()),
     );
 
     if sources.is_empty() {
@@ -102,8 +100,8 @@ pub fn attach(
         http,
         &sources,
         &dest,
-        config.fetch.max_size,
-        config.fetch.timeout,
+        fetch::Limits::new(config.fetch.max_size, config.fetch.timeout)
+            .paced(config.fetch.rate_limit),
     )
     .map_err(|failures| {
         anyhow::anyhow!(
@@ -118,6 +116,55 @@ pub fn attach(
 
     record(store, doc, &name, &used)?;
     Ok(Some(used))
+}
+
+/// The entry's arXiv ID, from wherever it was recorded.
+///
+/// Three places, because three tools disagree: `bib` files it as a serial
+/// number, papis and Zotero leave it in the `note` ("arXiv:0802.1919
+/// [quant-ph]"), and a great many records have it only as the URL. Consulting
+/// just the serial number means a library imported from any of them looks, to
+/// the fetcher, like it has no preprint — while every entry in it links to one.
+fn arxiv_of(entry: &Entry) -> Option<String> {
+    if let Some(id) = entry.arxiv().and_then(patterns::normalize_arxiv) {
+        return Some(id);
+    }
+    if let Some(id) = entry
+        .url()
+        .and_then(|u| patterns::arxiv_in_url(u.value.as_ref()))
+    {
+        return Some(id);
+    }
+    entry
+        .note()
+        .and_then(|note| patterns::find_arxiv(&note.to_string()).into_iter().next())
+}
+
+/// Ask OpenAlex where an open-access copy of this DOI lives.
+///
+/// The location is not a bibliographic field, so it is nowhere in the record
+/// and has to be asked for. Skipped when an arXiv ID is known: that copy is
+/// already the best answer, and this is a network round trip. Skipped too when
+/// `fetch.sources` does not list `openalex`, which is what that setting is for.
+///
+/// A failure is not reported: this is one of several ways to find a file, and
+/// the ones that follow it are still worth trying.
+fn open_access_url(
+    http: &Http,
+    config: &Config,
+    entry: &Entry,
+    have_arxiv: bool,
+) -> Option<String> {
+    if have_arxiv || !config.fetch.sources.iter().any(|s| s == "openalex") {
+        return None;
+    }
+    let doi = entry.doi().and_then(Identifier::parse_doi)?;
+    crate::providers::registry(&config.providers)
+        .iter()
+        .find(|provider| provider.name() == "openalex")?
+        .fetch(http, &doi)
+        .ok()?
+        .oa_url
 }
 
 /// Restrict candidate sources to those the configuration permits.
@@ -172,4 +219,49 @@ pub fn note_source(meta: &mut crate::model::Meta, name: &str, source: &PdfSource
         "files".to_owned(),
         format!("{} ({})", source.origin, source.url),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::bridge;
+
+    fn entry(yaml: &str) -> Entry {
+        bridge::to_entry("t", &serde_yaml::from_str(yaml).expect("valid YAML"))
+            .expect("valid entry")
+    }
+
+    #[test]
+    fn an_arxiv_serial_number_is_used_directly() {
+        let e = entry("type: article\ntitle: X\nserial-number: {arxiv: 2405.00781}\n");
+        assert_eq!(arxiv_of(&e).as_deref(), Some("2405.00781"));
+    }
+
+    /// The shape a papis or Zotero import produces: the published DOI as the
+    /// serial number, and the preprint only in the URL. Reading the serial
+    /// number alone would find no arXiv copy for the entire library.
+    #[test]
+    fn an_arxiv_link_is_enough_when_the_serial_number_is_the_doi() {
+        let e = entry(
+            "type: article\ntitle: X\nurl: http://arxiv.org/abs/0802.1919\n\
+             serial-number: {doi: 10.1007/s00220-009-0873-6}\n",
+        );
+        assert_eq!(arxiv_of(&e).as_deref(), Some("0802.1919"));
+    }
+
+    /// Zotero leaves it here, and papis carries the field across verbatim.
+    #[test]
+    fn the_note_is_consulted_last() {
+        let e = entry("type: article\ntitle: X\nnote: 'arXiv:0802.1919 [quant-ph]'\n");
+        assert_eq!(arxiv_of(&e).as_deref(), Some("0802.1919"));
+    }
+
+    #[test]
+    fn a_record_with_no_preprint_reports_none() {
+        let e = entry(
+            "type: article\ntitle: X\nurl: https://www.nature.com/articles/x\n\
+             note: published version\nserial-number: {doi: 10.1038/x}\n",
+        );
+        assert_eq!(arxiv_of(&e), None);
+    }
 }

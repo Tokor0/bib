@@ -189,16 +189,19 @@ fn identifier_of(doc: &Document) -> Option<Identifier> {
 }
 
 /// Resolve cite keys, or a query, to documents.
+///
+/// Cite keys win over the query language whenever *every* argument is one, so
+/// `bib list -k | xargs bib fetch` addresses those documents and nothing else.
+/// That composition is the only way to act on a whole library, and reading the
+/// keys as one long full-text query — which is what joining them amounts to —
+/// silently matches something else entirely, or nothing at all.
 pub fn select(store: &Store, target: &[String]) -> Result<Vec<Document>> {
     if target.is_empty() {
         bail!("name a cite key, or a query selecting what to update");
     }
-    // An exact cite key is the common case and must not be reinterpreted as a
-    // full-text search that happens to match something else.
-    if target.len() == 1
-        && let Ok(doc) = store.get(&target[0])
-    {
-        return Ok(vec![doc]);
+    let by_key: Option<Vec<Document>> = target.iter().map(|t| store.get(t).ok()).collect();
+    if let Some(docs) = by_key {
+        return Ok(docs);
     }
 
     let text = target.join(" ");
@@ -225,6 +228,55 @@ mod tests {
             .iter()
             .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
             .collect()
+    }
+
+    /// A library holding two documents, for the selection rules below.
+    fn library() -> (tempfile::TempDir, Store) {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::new(crate::config::ResolvedLibrary {
+            name: "t".into(),
+            dir: temp.path().to_path_buf(),
+        });
+        for (key, title) in [("smith2020a", "Alpha"), ("jones2021b", "Beta")] {
+            store
+                .create(
+                    key,
+                    std::path::Path::new(key),
+                    &value(&format!("type: article\ntitle: {title}\n")),
+                )
+                .unwrap();
+        }
+        (temp, store)
+    }
+
+    /// `bib list -k | xargs bib fetch` is the only way to act on a whole
+    /// library, and it hands over every key at once.
+    #[test]
+    fn several_cite_keys_select_those_documents() {
+        let (_temp, store) = library();
+        let target = ["smith2020a".to_owned(), "jones2021b".to_owned()];
+        let selected = select(&store, &target).expect("both keys exist");
+
+        let keys: Vec<_> = selected.iter().map(|d| d.citekey.as_str()).collect();
+        assert_eq!(keys, ["smith2020a", "jones2021b"]);
+    }
+
+    #[test]
+    fn a_single_cite_key_is_not_read_as_a_search() {
+        let (_temp, store) = library();
+        let selected = select(&store, &["smith2020a".to_owned()]).unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].citekey, "smith2020a");
+    }
+
+    /// Anything that is not entirely cite keys is still a query, so
+    /// `bib update author:smith` keeps working.
+    #[test]
+    fn words_that_are_not_all_keys_are_a_query() {
+        let (_temp, store) = library();
+        let selected = select(&store, &["title:Alpha".to_owned()]).expect("query should run");
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].citekey, "smith2020a");
     }
 
     #[test]

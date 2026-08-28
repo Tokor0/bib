@@ -26,6 +26,18 @@ pub struct ExportArgs {
     #[arg(long, short = 'f', value_enum, default_value_t = ExportFormat::Hayagriva)]
     pub format: ExportFormat,
 
+    /// Leave a field out of the bibliography, e.g. `--exclude abstract`.
+    /// Repeatable.
+    ///
+    /// Replaces the configured list rather than adding to it, so a command line
+    /// that mentions exclusions describes all of them.
+    #[arg(long, value_name = "FIELD")]
+    pub exclude: Vec<String>,
+
+    /// Export every field, including the ones configuration excludes.
+    #[arg(long, conflicts_with = "exclude")]
+    pub all_fields: bool,
+
     /// Write to a file instead of stdout.
     #[arg(long, short = 'o')]
     pub output: Option<PathBuf>,
@@ -72,7 +84,14 @@ pub fn run(args: ExportArgs, library: Option<&str>) -> Result<()> {
         );
     }
 
-    let rendered = formats::export(&selected, args.format)?;
+    // Command line first, then configuration: `--all-fields` is how a one-off
+    // export gets back what the configured list normally drops.
+    let exclude: &[String] = match () {
+        () if args.all_fields => &[],
+        () if !args.exclude.is_empty() => &args.exclude,
+        () => &loaded.config.export.exclude,
+    };
+    let rendered = formats::export(&selected, args.format, exclude)?;
 
     match &args.output {
         Some(path) => {

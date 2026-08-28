@@ -68,7 +68,11 @@ pub struct Http {
     /// Contact address for Crossref's polite pool. Only ever sent when the user
     /// has explicitly configured it.
     mailto: Option<String>,
-    last_call: Mutex<BTreeMap<&'static str, Instant>>,
+    /// When each rate-limited peer was last called. Keyed by provider name for
+    /// metadata lookups and by host for downloads, which are the same thing
+    /// from the far end's point of view: one client, one service, some interval
+    /// between requests.
+    last_call: Mutex<BTreeMap<String, Instant>>,
     offline: bool,
 }
 
@@ -184,15 +188,22 @@ impl Http {
     /// Unlike [`Self::get`] this is never cached: a PDF belongs in the library
     /// directory, not in the HTTP cache, and streaming lets the caller reject a
     /// non-PDF or an oversized body without buffering it first.
+    ///
+    /// Paced by host rather than by provider, because a download is not a
+    /// provider call: `bib fetch` over a whole library is one client asking
+    /// arxiv.org for sixty files in a row, and arXiv asks callers to leave a
+    /// gap. `rate` is what the caller's configuration says that gap is.
     pub fn get_reader(
         &self,
         url: &str,
         accept: &str,
         timeout: Duration,
+        rate: Duration,
     ) -> Result<Box<dyn std::io::Read + Send + Sync>, ProviderError> {
         if self.offline {
             return Err(ProviderError::Network("offline".into()));
         }
+        self.wait_for(host_of(url), rate);
         let agent = ureq::Agent::new_with_config(
             ureq::Agent::config_builder()
                 .timeout_global(Some(timeout))
@@ -236,19 +247,31 @@ impl Http {
         Some(dir.join(format!("{provider}-{key:016x}.txt")))
     }
 
-    fn wait_for(&self, provider: &'static str, rate: Duration) {
+    fn wait_for(&self, peer: &str, rate: Duration) {
         if rate.is_zero() {
             return;
         }
         let mut last = self.last_call.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(previous) = last.get(provider) {
+        if let Some(previous) = last.get(peer) {
             let elapsed = previous.elapsed();
             if elapsed < rate {
                 std::thread::sleep(rate - elapsed);
             }
         }
-        last.insert(provider, Instant::now());
+        last.insert(peer.to_owned(), Instant::now());
     }
+}
+
+/// The host part of a URL, for rate limiting. Falls back to the whole string,
+/// which pairs a malformed URL with itself and paces nothing else.
+fn host_of(url: &str) -> &str {
+    let without_scheme = url
+        .trim_start_matches("https://")
+        .trim_start_matches("http://");
+    without_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(without_scheme)
 }
 
 impl Default for Http {

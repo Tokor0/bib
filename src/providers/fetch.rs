@@ -22,9 +22,18 @@
 //! In practice this succeeds for arXiv and genuine open-access repositories and
 //! fails for much "bronze" access; that is the state of the world, not a defect
 //! to engineer around.
+//!
+//! What *is* worth doing is asking for the right URL in the first place. A
+//! record's stored URL is nearly always a **landing page** — `arxiv.org/abs/…`
+//! rather than `arxiv.org/pdf/…` — because that is the link publishers and
+//! importers record. Rewriting the handful of landing-page shapes whose PDF
+//! location is mechanical ([`pdf_form`]) is the difference between "no PDF
+//! available" and the file being one request away, and it is not scraping: no
+//! page is read to find the link, the URL is derived from the identifier the
+//! record already holds.
 
 use super::{Http, ProviderError};
-use crate::identify::patterns::Identifier;
+use crate::identify::patterns::arxiv_in_url;
 use std::io::Read;
 use std::path::Path;
 use std::time::Duration;
@@ -83,37 +92,117 @@ impl std::fmt::Display for FetchError {
 impl std::error::Error for FetchError {}
 
 /// Where a PDF for this record might be, best first.
-pub fn candidates(
-    id: Option<&Identifier>,
-    oa_url: Option<&str>,
-    url: Option<&str>,
-) -> Vec<PdfSource> {
-    let mut out = Vec::new();
+///
+/// `arxiv` is the ID from the record's serial numbers, its URL or its note —
+/// wherever it was recorded — and is passed separately from the DOI on purpose:
+/// a published paper with a preprint has both, the DOI resolves to a publisher
+/// landing page, and the arXiv copy is the one that is actually a PDF.
+pub fn candidates(arxiv: Option<&str>, oa_url: Option<&str>, url: Option<&str>) -> Vec<PdfSource> {
+    let mut out: Vec<PdfSource> = Vec::new();
+    let mut push = |url: String, origin: &'static str| {
+        if !url.trim().is_empty() && !out.iter().any(|s| s.url == url) {
+            out.push(PdfSource { url, origin });
+        }
+    };
 
     // arXiv first: deterministic, always a real PDF, no interstitial.
-    if let Some(Identifier::ArXiv(arxiv)) = id {
-        out.push(PdfSource {
-            url: format!("https://arxiv.org/pdf/{arxiv}"),
-            origin: "arxiv",
-        });
+    if let Some(arxiv) = arxiv.filter(|a| !a.trim().is_empty()) {
+        push(format!("https://arxiv.org/pdf/{arxiv}"), "arxiv");
     }
-    if let Some(oa_url) = oa_url.filter(|u| !u.trim().is_empty()) {
-        out.push(PdfSource {
-            url: oa_url.to_owned(),
-            origin: "openalex",
-        });
+    if let Some(oa_url) = oa_url {
+        push(oa_url.to_owned(), "openalex");
     }
     // The record's own URL is a long shot — usually a landing page — so it is
-    // tried last rather than not at all.
-    if let Some(url) = url.filter(|u| !u.trim().is_empty())
-        && !out.iter().any(|s| s.url == *url)
-    {
-        out.push(PdfSource {
-            url: url.to_owned(),
-            origin: "url",
-        });
+    // tried last rather than not at all. Where that page's PDF sits at a known
+    // address, the derived URL is tried first and the page itself kept as the
+    // fallback: the rewrite is a guess, and a guess must not remove an option.
+    if let Some(url) = url {
+        if let Some(derived) = pdf_form(url) {
+            push(derived, "url");
+        }
+        push(url.to_owned(), "url");
     }
     out
+}
+
+/// The PDF address for a landing page whose layout is mechanical.
+///
+/// Deliberately a short list. Each entry is a documented, stable URL scheme
+/// where the file location follows from the page location with no lookup —
+/// anything requiring the page to be parsed belongs to the "no scraping" rule
+/// above, not here. A wrong guess costs nothing: the download sniffs for `%PDF-`
+/// and the original URL is still tried.
+fn pdf_form(url: &str) -> Option<String> {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    // arxiv.org/abs/ID -> arxiv.org/pdf/ID.
+    if let Some(id) = arxiv_in_url(trimmed) {
+        return Some(format!("https://arxiv.org/pdf/{id}"));
+    }
+    // openreview.net/forum?id=X -> openreview.net/pdf?id=X.
+    if let Some(rest) = after_host(trimmed, "openreview.net")
+        && let Some(id) = rest.strip_prefix("/forum?id=")
+    {
+        return Some(format!("https://openreview.net/pdf?id={id}"));
+    }
+    // bioRxiv and medRxiv append `.full.pdf` to the article path.
+    for host in ["biorxiv.org", "medrxiv.org"] {
+        if let Some(rest) = after_host(trimmed, host)
+            && rest.starts_with("/content/")
+            && !rest.ends_with(".pdf")
+        {
+            return Some(format!(
+                "https://www.{host}{}.full.pdf",
+                rest.trim_end_matches('/')
+            ));
+        }
+    }
+    None
+}
+
+/// The path of `url` when it is served by `host`, ignoring scheme and `www.`.
+fn after_host<'a>(url: &'a str, host: &str) -> Option<&'a str> {
+    let without_scheme = url
+        .trim_start_matches("https://")
+        .trim_start_matches("http://");
+    let rest = without_scheme
+        .strip_prefix("www.")
+        .unwrap_or(without_scheme);
+    rest.strip_prefix(host).filter(|r| r.starts_with('/'))
+}
+
+/// The bounds one download runs under.
+///
+/// Grouped rather than passed as three positional arguments: two of them are
+/// `Duration`s meaning different things, and a call site that swaps a timeout
+/// for a rate limit would compile.
+#[derive(Debug, Clone, Copy)]
+pub struct Limits {
+    /// Refused mid-stream once exceeded.
+    pub max_bytes: u64,
+    /// Ceiling on a single request.
+    pub timeout: Duration,
+    /// Minimum gap between requests to the same host.
+    pub rate: Duration,
+}
+
+impl Limits {
+    /// Unpaced: one download, with nothing before or after it to be polite to.
+    pub fn new(max_bytes: u64, timeout: Duration) -> Self {
+        Self {
+            max_bytes,
+            timeout,
+            rate: Duration::ZERO,
+        }
+    }
+
+    pub fn paced(mut self, rate: Duration) -> Self {
+        self.rate = rate;
+        self
+    }
 }
 
 /// Try each source in turn; the first that yields a real PDF wins.
@@ -124,15 +213,14 @@ pub fn download_first(
     http: &Http,
     sources: &[PdfSource],
     dest: &Path,
-    max_bytes: u64,
-    timeout: Duration,
+    limits: Limits,
 ) -> Result<PdfSource, Vec<FetchError>> {
     if sources.is_empty() {
         return Err(vec![FetchError::NoSource]);
     }
     let mut failures = Vec::new();
     for source in sources {
-        match download(http, &source.url, dest, max_bytes, timeout) {
+        match download(http, &source.url, dest, limits) {
             Ok(()) => return Ok(source.clone()),
             Err(e) => failures.push(e),
         }
@@ -141,15 +229,9 @@ pub fn download_first(
 }
 
 /// Download one URL to `dest`, verifying it really is a PDF.
-pub fn download(
-    http: &Http,
-    url: &str,
-    dest: &Path,
-    max_bytes: u64,
-    timeout: Duration,
-) -> Result<(), FetchError> {
+pub fn download(http: &Http, url: &str, dest: &Path, limits: Limits) -> Result<(), FetchError> {
     let mut reader = http
-        .get_reader(url, "application/pdf", timeout)
+        .get_reader(url, "application/pdf", limits.timeout, limits.rate)
         .map_err(|source| FetchError::Http {
             url: url.to_owned(),
             source,
@@ -191,12 +273,12 @@ pub fn download(
             break;
         }
         written += n as u64;
-        if written > max_bytes {
+        if written > limits.max_bytes {
             // Refused mid-stream rather than after: the point of a cap is not
             // to fill the disk first and complain afterwards.
             return Err(FetchError::TooLarge {
                 url: url.to_owned(),
-                limit: max_bytes,
+                limit: limits.max_bytes,
             });
         }
         std::io::Write::write_all(&mut file, &buffer[..n]).map_err(FetchError::Io)?;
@@ -231,7 +313,7 @@ mod tests {
     #[test]
     fn arxiv_is_tried_before_anything_else() {
         let sources = candidates(
-            Some(&Identifier::ArXiv("1706.03762".into())),
+            Some("1706.03762"),
             Some("https://example.org/oa.pdf"),
             Some("https://example.org/landing"),
         );
@@ -250,10 +332,62 @@ mod tests {
         assert_eq!(sources.len(), 1);
     }
 
+    /// The landing page for a record whose arXiv ID was never recorded as one:
+    /// the rewrite is the only thing standing between this and an HTML page
+    /// saved as `paper.pdf`.
+    #[test]
+    fn an_abs_link_is_rewritten_to_the_pdf_and_the_page_kept_as_fallback() {
+        let sources = candidates(None, None, Some("http://arxiv.org/abs/0802.1919"));
+        assert_eq!(
+            sources.iter().map(|s| s.url.as_str()).collect::<Vec<_>>(),
+            [
+                "https://arxiv.org/pdf/0802.1919",
+                "http://arxiv.org/abs/0802.1919"
+            ]
+        );
+    }
+
+    /// The same paper reached two ways must not be downloaded twice.
+    #[test]
+    fn a_rewritten_url_does_not_duplicate_the_arxiv_source() {
+        let sources = candidates(
+            Some("0802.1919"),
+            None,
+            Some("https://arxiv.org/abs/0802.1919"),
+        );
+        assert_eq!(sources.len(), 2, "{sources:?}");
+        assert_eq!(sources[0].url, "https://arxiv.org/pdf/0802.1919");
+        assert_eq!(sources[1].url, "https://arxiv.org/abs/0802.1919");
+    }
+
+    #[test]
+    fn known_landing_pages_are_rewritten() {
+        assert_eq!(
+            pdf_form("https://openreview.net/forum?id=abc123").as_deref(),
+            Some("https://openreview.net/pdf?id=abc123")
+        );
+        assert_eq!(
+            pdf_form("https://www.biorxiv.org/content/10.1101/2020.01.01.000001v1").as_deref(),
+            Some("https://www.biorxiv.org/content/10.1101/2020.01.01.000001v1.full.pdf")
+        );
+    }
+
+    /// Anything whose PDF location is not mechanical is left alone rather than
+    /// guessed at — a publisher landing page is tried as itself, and fails
+    /// honestly.
+    #[test]
+    fn an_unknown_landing_page_is_not_rewritten() {
+        assert!(pdf_form("https://doi.org/10.1038/s41586-019-1666-5").is_none());
+        assert!(pdf_form("https://link.aps.org/doi/10.1103/PRXQuantum.3.020365").is_none());
+        assert!(pdf_form("https://example.org/openreview.net/forum?id=x").is_none());
+        assert!(pdf_form("").is_none());
+    }
+
     #[test]
     fn nothing_known_yields_no_sources() {
         assert!(candidates(None, None, None).is_empty());
         assert!(candidates(None, Some("  "), None).is_empty());
+        assert!(candidates(Some(" "), None, Some("")).is_empty());
     }
 
     #[test]

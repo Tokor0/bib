@@ -37,13 +37,64 @@ impl Document {
             .unwrap_or_default()
     }
 
-    /// Absolute paths of the document's attachments.
+    /// Absolute paths of the document's attachments, as recorded.
     pub fn files(&self) -> Vec<PathBuf> {
         self.meta().files.iter().map(|f| self.dir.join(f)).collect()
     }
 
+    /// The attachments that are actually on disk.
+    ///
+    /// The `files:` list is a record, not a guarantee: an import can carry the
+    /// names of files it did not copy, and a file can be moved out from under
+    /// the library. Anything deciding whether a document *has* its document —
+    /// `bib fetch` above all — has to ask the filesystem, or it skips precisely
+    /// the entries that are missing one.
+    pub fn attachments(&self) -> Vec<PathBuf> {
+        self.files().into_iter().filter(|p| p.is_file()).collect()
+    }
+
     pub fn info_path(&self) -> PathBuf {
         self.dir.join(crate::store::INFO_FILE)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn document(dir: PathBuf, files: &[&str]) -> Document {
+        let list = files
+            .iter()
+            .map(|f| format!("  - {f}\n"))
+            .collect::<String>();
+        Document {
+            citekey: "t".to_owned(),
+            dir,
+            value: serde_yaml::from_str(&format!(
+                "type: article\ntitle: X\nx-bib:\n  files:\n{list}"
+            ))
+            .expect("valid YAML"),
+        }
+    }
+
+    /// The distinction `bib fetch` turns on: what the record says, and what is
+    /// actually there.
+    #[test]
+    fn only_files_on_disk_count_as_attachments() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("here.pdf"), b"%PDF-1.7\n").unwrap();
+        let doc = document(temp.path().to_path_buf(), &["here.pdf", "gone.pdf"]);
+
+        assert_eq!(doc.files().len(), 2, "the record names both");
+        assert_eq!(doc.attachments().len(), 1, "only one is there");
+        assert!(doc.attachments()[0].ends_with("here.pdf"));
+    }
+
+    #[test]
+    fn a_record_naming_a_file_that_is_not_there_has_no_attachments() {
+        let temp = tempfile::tempdir().unwrap();
+        let doc = document(temp.path().to_path_buf(), &["gone.pdf"]);
+        assert!(doc.attachments().is_empty());
     }
 }
 

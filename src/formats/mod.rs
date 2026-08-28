@@ -20,9 +20,18 @@ pub enum ExportFormat {
     Biblatex,
 }
 
-/// Render documents in the requested format.
-pub fn export(docs: &[Document], format: ExportFormat) -> Result<String> {
-    let entries: Vec<hayagriva::Entry> = docs.iter().map(Document::entry).collect::<Result<_>>()?;
+/// Render documents in the requested format, leaving out `exclude`d fields.
+///
+/// The exclusion applies to every format rather than to hayagriva alone: it
+/// says what belongs in a bibliography, and that answer does not change because
+/// the file is a `.bib`. Names are checked first, so a typo is an error here
+/// rather than a field that quietly stayed in.
+pub fn export(docs: &[Document], format: ExportFormat, exclude: &[String]) -> Result<String> {
+    bridge::check_fields(exclude)?;
+    let entries: Vec<hayagriva::Entry> = docs
+        .iter()
+        .map(|doc| bridge::to_entry(&doc.citekey, &bridge::prune(&doc.value, exclude)))
+        .collect::<Result<_>>()?;
     let library = bridge::library_from(&entries);
 
     match format {

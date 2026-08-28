@@ -12,7 +12,7 @@
 //! `from_value` directly, with no string round-trip to introduce quoting or
 //! type-inference drift.
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use hayagriva::{Entry, Library};
 use serde_yaml::{Mapping, Value};
 
@@ -62,6 +62,93 @@ pub fn set_meta(value: &mut Value, meta: Value) -> Result<()> {
         .ok_or_else(|| anyhow!("document body is not a mapping"))?;
     map.insert(Value::String(META_KEY.to_owned()), meta);
     Ok(())
+}
+
+/// Every field an exported entry may carry, as hayagriva spells it.
+///
+/// Taken from hayagriva 0.10's `entry!` macro, plus `parent`, which the macro
+/// adds by hand. It exists so that a name nobody recognises is refused rather
+/// than silently matching nothing: an exclusion that quietly does not apply is
+/// a bibliography with the wrong content in it, discovered at proofreading
+/// time. `type` is deliberately absent — see [`prune`].
+pub const EXPORTABLE_FIELDS: &[&str] = &[
+    "abstract",
+    "affiliated",
+    "archive",
+    "archive-location",
+    "author",
+    "call-number",
+    "chapter",
+    "date",
+    "edition",
+    "editor",
+    "genre",
+    "issue",
+    "language",
+    "location",
+    "note",
+    "organization",
+    "page-range",
+    "page-total",
+    "parent",
+    "publisher",
+    "runtime",
+    "serial-number",
+    "time-range",
+    "title",
+    "url",
+    "volume",
+    "volume-total",
+];
+
+/// Check that every name in `fields` is one an entry can actually have.
+pub fn check_fields(fields: &[String]) -> Result<()> {
+    for field in fields {
+        if EXPORTABLE_FIELDS.contains(&field.as_str()) {
+            continue;
+        }
+        // `type` is the one field whose removal produces an entry that will not
+        // parse at all, so it gets its own answer rather than "no such field".
+        if field == "type" {
+            bail!("`type` cannot be excluded: an entry without one is not a bibliography entry");
+        }
+        bail!(
+            "`{field}` is not an entry field\nhint: one of {}",
+            EXPORTABLE_FIELDS.join(", ")
+        );
+    }
+    Ok(())
+}
+
+/// Drop `fields` from a document body, parents included.
+///
+/// Applied on the way out of the library rather than to what is stored: the
+/// record keeps everything it was given, and the bibliography carries only what
+/// a reader of it needs. Parents are pruned too, so `--exclude abstract` means
+/// the same thing wherever an abstract happens to sit.
+pub fn prune(value: &Value, fields: &[String]) -> Value {
+    let Value::Mapping(map) = value else {
+        return value.clone();
+    };
+    let mut out = Mapping::with_capacity(map.len());
+    for (key, child) in map {
+        if key
+            .as_str()
+            .is_some_and(|name| fields.iter().any(|f| f == name))
+        {
+            continue;
+        }
+        let child = match child {
+            Value::Mapping(_) => prune(child, fields),
+            // A parent may be a single mapping or a list of them.
+            Value::Sequence(items) => {
+                Value::Sequence(items.iter().map(|item| prune(item, fields)).collect())
+            }
+            other => other.clone(),
+        };
+        out.insert(key.clone(), child);
+    }
+    Value::Mapping(out)
 }
 
 /// Collect documents into a hayagriva [`Library`], ready for `to_yaml_str`.
@@ -119,6 +206,73 @@ x-bib:
         );
         // Would error on the unknown `x-bib` field if it were not removed.
         assert!(to_entry("einstein1905", &value).is_ok());
+    }
+
+    #[test]
+    fn pruning_removes_a_field_and_leaves_the_entry_valid() {
+        let value = parse(ARTICLE);
+        let pruned = prune(&value, &["page-range".to_owned()]);
+        assert!(pruned.get("page-range").is_none());
+        let entry = to_entry("einstein1905", &pruned).expect("pruned body should still parse");
+        assert_eq!(
+            entry.title().unwrap().to_string(),
+            value["title"].as_str().unwrap()
+        );
+        assert!(entry.page_range().is_none());
+    }
+
+    /// A field means the same thing wherever it sits, so a container's copy
+    /// goes too — otherwise an excluded field reappears under `parent:`.
+    #[test]
+    fn pruning_reaches_into_parents() {
+        let value = parse(
+            "type: article\ntitle: X\nabstract: outer\n\
+             parent:\n  type: periodical\n  title: Y\n  abstract: inner\n",
+        );
+        let pruned = prune(&value, &["abstract".to_owned()]);
+        let yaml = serde_yaml::to_string(&pruned).unwrap();
+        assert!(!yaml.contains("outer"), "{yaml}");
+        assert!(!yaml.contains("inner"), "{yaml}");
+        assert!(
+            yaml.contains("title: Y"),
+            "parent itself was removed:\n{yaml}"
+        );
+    }
+
+    #[test]
+    fn pruning_nothing_changes_nothing() {
+        let value = parse(ARTICLE);
+        assert_eq!(prune(&value, &[]), value);
+    }
+
+    /// A misspelled field would otherwise exclude nothing at all, and the first
+    /// sign of it would be an unwanted field in a rendered bibliography.
+    #[test]
+    fn an_unknown_field_name_is_refused() {
+        assert!(check_fields(&["abstract".to_owned(), "note".to_owned()]).is_ok());
+
+        let err = check_fields(&["abstrct".to_owned()]).unwrap_err();
+        assert!(format!("{err}").contains("abstrct"), "{err}");
+
+        // Removing the type leaves something that is not an entry at all.
+        let err = check_fields(&["type".to_owned()]).unwrap_err();
+        assert!(format!("{err}").contains("type"), "{err}");
+    }
+
+    /// The list is transcribed from hayagriva, so it can drift on an upgrade.
+    /// `has` answers for names hayagriva knows, which pins the transcription
+    /// for every field a real entry carries.
+    #[test]
+    fn the_field_list_matches_hayagriva() {
+        let entry = to_entry("einstein1905", &parse(ARTICLE)).unwrap();
+        for field in ["title", "author", "date", "page-range", "serial-number"] {
+            assert!(entry.has(field), "hayagriva does not know `{field}`");
+            assert!(
+                EXPORTABLE_FIELDS.contains(&field),
+                "`{field}` is missing from EXPORTABLE_FIELDS"
+            );
+        }
+        assert!(!entry.has("journal"), "`journal` is not a hayagriva field");
     }
 
     /// A body with no meta block is equally valid — the key is optional.

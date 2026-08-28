@@ -167,14 +167,39 @@ pub fn find_arxiv(text: &str) -> Vec<String> {
     found
 }
 
+/// An arXiv link in any of the forms the site serves.
+///
+/// `/abs/` is the landing page, `/pdf/` the file itself, and records carry
+/// whichever one their source happened to store — so the host and path shape
+/// are matched rather than a fixed prefix list, and the ID is validated
+/// afterwards like any other.
+static ARXIV_URL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)^(?:https?://)?(?:www\.|export\.)?arxiv\.org/(?:abs|pdf|format)/(.+?)(?:\.pdf)?/?$",
+    )
+    .expect("arXiv URL pattern should compile")
+});
+
+/// The arXiv ID a URL points at, whatever form the link takes.
+///
+/// Separate from [`normalize_arxiv`] because the caller's question is
+/// different: not "is this an identifier" but "does this link name a paper we
+/// can ask arXiv for directly". A record's stored URL is nearly always the
+/// `/abs/` landing page, which is HTML; the PDF is one path segment away, and
+/// this is what finds it.
+pub fn arxiv_in_url(url: &str) -> Option<String> {
+    let id = ARXIV_URL.captures(url.trim())?.get(1)?.as_str();
+    ARXIV_BARE.is_match(id).then(|| id.to_owned())
+}
+
 pub fn normalize_arxiv(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
+    if let Some(id) = arxiv_in_url(trimmed) {
+        return Some(id);
+    }
     let without_prefix = trimmed
         .trim_start_matches("arXiv:")
         .trim_start_matches("arxiv:")
-        .trim_start_matches("https://arxiv.org/abs/")
-        .trim_start_matches("http://arxiv.org/abs/")
-        .trim_start_matches("https://arxiv.org/pdf/")
         .trim_end_matches(".pdf")
         .trim();
     ARXIV_BARE
@@ -328,6 +353,41 @@ mod tests {
             normalize_arxiv("arXiv:2301.12345v3").as_deref(),
             Some("2301.12345v3")
         );
+    }
+
+    /// Every shape a stored URL actually takes. `http://arxiv.org/abs/…` is the
+    /// one that matters most: it is what papis and Zotero record, and it is a
+    /// landing page, so a fetch that trusts it downloads HTML.
+    #[test]
+    fn an_arxiv_link_yields_its_id_whatever_form_it_takes() {
+        for url in [
+            "http://arxiv.org/abs/0802.1919",
+            "https://arxiv.org/abs/0802.1919",
+            "https://www.arxiv.org/abs/0802.1919",
+            "https://export.arxiv.org/abs/0802.1919",
+            "https://arxiv.org/pdf/0802.1919",
+            "https://arxiv.org/pdf/0802.1919.pdf",
+            "https://arxiv.org/abs/0802.1919/",
+        ] {
+            assert_eq!(arxiv_in_url(url).as_deref(), Some("0802.1919"), "{url}");
+        }
+        // The version is part of the ID and must survive.
+        assert_eq!(
+            arxiv_in_url("https://arxiv.org/abs/2405.00781v2").as_deref(),
+            Some("2405.00781v2")
+        );
+        // Old-style identifiers carry a slash of their own.
+        assert_eq!(
+            arxiv_in_url("https://arxiv.org/abs/math.GT/0309136").as_deref(),
+            Some("math.GT/0309136")
+        );
+    }
+
+    #[test]
+    fn a_link_that_is_not_an_arxiv_paper_yields_nothing() {
+        assert!(arxiv_in_url("https://arxiv.org/list/quant-ph/new").is_none());
+        assert!(arxiv_in_url("https://example.org/abs/2301.12345").is_none());
+        assert!(arxiv_in_url("https://doi.org/10.1007/s00220-009-0873-6").is_none());
     }
 
     #[test]

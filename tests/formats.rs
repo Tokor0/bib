@@ -50,7 +50,7 @@ fn bibtex_imports_and_exports_as_hayagriva() {
     let docs = docs_from_bib(SAMPLE_BIB);
     assert_eq!(docs.len(), 3);
 
-    let yaml = export(&docs, ExportFormat::Hayagriva).expect("should export");
+    let yaml = export(&docs, ExportFormat::Hayagriva, &[]).expect("should export");
 
     // Containment is modelled as a parent entry, not a flat `journal` field.
     assert!(yaml.contains("parent:"), "expected nested parent:\n{yaml}");
@@ -70,7 +70,7 @@ fn bibtex_imports_and_exports_as_hayagriva() {
 #[test]
 fn inproceedings_survives_a_bibtex_round_trip() {
     let docs = docs_from_bib(SAMPLE_BIB);
-    let out = export(&docs, ExportFormat::Bibtex).expect("should export");
+    let out = export(&docs, ExportFormat::Bibtex, &[]).expect("should export");
 
     assert!(out.contains("@inproceedings{vaswani2017"), "got:\n{out}");
     assert!(
@@ -88,7 +88,7 @@ fn inproceedings_survives_a_bibtex_round_trip() {
 #[test]
 fn publisher_location_becomes_bibtex_address() {
     let docs = docs_from_bib(SAMPLE_BIB);
-    let out = export(&docs, ExportFormat::Bibtex).expect("should export");
+    let out = export(&docs, ExportFormat::Bibtex, &[]).expect("should export");
     assert!(
         out.contains("address = {Reading, MA}"),
         "address was dropped:\n{out}"
@@ -98,8 +98,8 @@ fn publisher_location_becomes_bibtex_address() {
 #[test]
 fn biblatex_uses_iso_dates_where_bibtex_uses_year() {
     let docs = docs_from_bib(SAMPLE_BIB);
-    let bibtex_out = export(&docs, ExportFormat::Bibtex).expect("should export");
-    let biblatex_out = export(&docs, ExportFormat::Biblatex).expect("should export");
+    let bibtex_out = export(&docs, ExportFormat::Bibtex, &[]).expect("should export");
+    let biblatex_out = export(&docs, ExportFormat::Biblatex, &[]).expect("should export");
 
     assert!(bibtex_out.contains("year = {1905}"));
     assert!(biblatex_out.contains("date = {1905}"));

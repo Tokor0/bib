@@ -2,8 +2,8 @@
 
 use crate::config;
 use crate::formats::{bibtex, papis};
-use crate::model::bridge;
 use crate::model::citekey::KeyMaker;
+use crate::model::{Document, bridge};
 use crate::store::Store;
 use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand};
@@ -46,6 +46,18 @@ pub struct CommonArgs {
     pub dry_run: bool,
 }
 
+/// One document on its way into the library.
+///
+/// `dir` is where the source kept this document's files, when the source is a
+/// directory of documents rather than a single bibliography file. It is what
+/// lets an import bring the PDFs with it instead of recording the names of
+/// files that are not there.
+struct Incoming {
+    key: String,
+    body: Value,
+    dir: Option<PathBuf>,
+}
+
 impl ImportSource {
     pub fn run(self, library: Option<&str>) -> Result<()> {
         match self {
@@ -54,7 +66,13 @@ impl ImportSource {
                 let lib = bibtex::from_bibtex(&text)?;
                 let items = lib
                     .into_iter()
-                    .map(|e| Ok((e.key().to_owned(), bridge::from_entry(&e)?)))
+                    .map(|e| {
+                        Ok(Incoming {
+                            key: e.key().to_owned(),
+                            body: bridge::from_entry(&e)?,
+                            dir: None,
+                        })
+                    })
                     .collect::<Result<Vec<_>>>()?;
                 ingest(items, &a.common, library)
             }
@@ -64,7 +82,13 @@ impl ImportSource {
                     .map_err(|e| anyhow::anyhow!("{}: {e}", a.path.display()))?;
                 let items = lib
                     .into_iter()
-                    .map(|e| Ok((e.key().to_owned(), bridge::from_entry(&e)?)))
+                    .map(|e| {
+                        Ok(Incoming {
+                            key: e.key().to_owned(),
+                            body: bridge::from_entry(&e)?,
+                            dir: None,
+                        })
+                    })
                     .collect::<Result<Vec<_>>>()?;
                 ingest(items, &a.common, library)
             }
@@ -78,7 +102,7 @@ fn read(path: &Path) -> Result<String> {
 }
 
 /// Collect `info.yaml` files from a papis library and map them.
-fn read_papis(dir: &Path) -> Result<Vec<(String, Value)>> {
+fn read_papis(dir: &Path) -> Result<Vec<Incoming>> {
     if !dir.is_dir() {
         bail!("{} is not a directory", dir.display());
     }
@@ -93,7 +117,7 @@ fn read_papis(dir: &Path) -> Result<Vec<(String, Value)>> {
     Ok(out)
 }
 
-fn collect_papis(dir: &Path, out: &mut Vec<(String, Value)>) -> Result<()> {
+fn collect_papis(dir: &Path, out: &mut Vec<Incoming>) -> Result<()> {
     for name in ["info.yaml", "info.yml"] {
         let candidate = dir.join(name);
         if !candidate.is_file() {
@@ -113,7 +137,11 @@ fn collect_papis(dir: &Path, out: &mut Vec<(String, Value)>) -> Result<()> {
             .map(str::to_owned)
             .or_else(|| dir.file_name().and_then(|n| n.to_str()).map(str::to_owned))
             .unwrap_or_else(|| "imported".to_owned());
-        out.push((key, body));
+        out.push(Incoming {
+            key,
+            body,
+            dir: Some(dir.to_path_buf()),
+        });
         return Ok(());
     }
 
@@ -126,8 +154,68 @@ fn collect_papis(dir: &Path, out: &mut Vec<(String, Value)>) -> Result<()> {
     Ok(())
 }
 
+/// What became of one document's attachments.
+struct Brought {
+    copied: usize,
+    /// Files the record named that the source did not have, as
+    /// `citekey/filename`, already removed from the record.
+    missing: Vec<String>,
+}
+
+/// Copy a document's attachments out of the library it came from.
+///
+/// The record is corrected to match what actually arrived. A `files:` list
+/// naming something that is not on disk is worse than no list at all: it is
+/// what makes `bib fetch` report "already has an attachment" for a document
+/// with no attachment, so the entries that most need a PDF are the ones it
+/// skips. A file the source has lost is therefore dropped from the record and
+/// reported, not carried over on faith.
+fn take_files(store: &Store, doc: &Document, from: &Path) -> Result<Brought> {
+    let mut meta = doc.meta();
+    if meta.files.is_empty() {
+        return Ok(Brought {
+            copied: 0,
+            missing: Vec::new(),
+        });
+    }
+
+    let mut kept = Vec::new();
+    let mut missing = Vec::new();
+    for file in &meta.files {
+        let Some(name) = file.file_name() else {
+            continue;
+        };
+        let source = from.join(file);
+        if !source.is_file() {
+            missing.push(format!("{}/{}", doc.citekey, file.display()));
+            continue;
+        }
+        std::fs::copy(&source, doc.dir.join(name))
+            .with_context(|| format!("could not copy {}", source.display()))?;
+        // Flattened to a bare name: the file now lives beside its `info.yml`,
+        // whatever nesting the source used.
+        kept.push(PathBuf::from(name));
+    }
+
+    let copied = kept.len();
+    // Rewritten only when the list actually changed, so an import that brought
+    // everything leaves the file it just wrote alone.
+    if kept != meta.files {
+        meta.files = kept;
+        let mut value = doc.value.clone();
+        bridge::set_meta(&mut value, serde_yaml::to_value(&meta)?)?;
+        store.save(&Document {
+            citekey: doc.citekey.clone(),
+            dir: doc.dir.clone(),
+            value,
+        })?;
+    }
+
+    Ok(Brought { copied, missing })
+}
+
 /// Write imported documents into the library, resolving keys and collisions.
-fn ingest(items: Vec<(String, Value)>, common: &CommonArgs, library: Option<&str>) -> Result<()> {
+fn ingest(items: Vec<Incoming>, common: &CommonArgs, library: Option<&str>) -> Result<()> {
     let loaded = config::load(library)?;
     let store = Store::new(loaded.library.clone());
     let maker = KeyMaker::new(&loaded.config.citekey);
@@ -143,9 +231,16 @@ fn ingest(items: Vec<(String, Value)>, common: &CommonArgs, library: Option<&str
         .collect();
 
     let mut imported = 0usize;
+    let mut copied = 0usize;
+    let mut lost = Vec::new();
     let mut failed = Vec::new();
 
-    for (source_key, body) in items {
+    for item in items {
+        let Incoming {
+            key: source_key,
+            body,
+            dir: source_dir,
+        } = item;
         let result = (|| -> Result<String> {
             let probe = bridge::to_entry(&source_key, &body)?;
             let base = if common.rekey {
@@ -158,7 +253,12 @@ fn ingest(items: Vec<(String, Value)>, common: &CommonArgs, library: Option<&str
             let entry = bridge::to_entry(&key, &body)?;
             let folder = maker.render_folder(&loaded.config.folder.template, &entry, &key)?;
             if !common.dry_run {
-                store.create(&key, &folder, &body)?;
+                let doc = store.create(&key, &folder, &body)?;
+                if let Some(source_dir) = &source_dir {
+                    let brought = take_files(&store, &doc, source_dir)?;
+                    copied += brought.copied;
+                    lost.extend(brought.missing);
+                }
             }
             Ok(key)
         })();
@@ -181,6 +281,19 @@ fn ingest(items: Vec<(String, Value)>, common: &CommonArgs, library: Option<&str
         "imported"
     };
     println!("{verb} {imported} document(s)");
+    if copied > 0 {
+        eprintln!("copied {copied} attachment(s)");
+    }
+    if !lost.is_empty() {
+        eprintln!(
+            "{} attachment(s) named by the source were not there and have been \
+             dropped from the record; `bib fetch` can look for them:",
+            lost.len()
+        );
+        for name in &lost {
+            eprintln!("  {name}");
+        }
+    }
     if !failed.is_empty() {
         eprintln!("{} could not be imported:", failed.len());
         for (key, e) in &failed {

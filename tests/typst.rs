@@ -116,7 +116,7 @@ fn every_generated_cite_key_resolves_in_typst() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(
         temp.path().join("bibliography.yml"),
-        export(&docs, ExportFormat::Hayagriva).unwrap(),
+        export(&docs, ExportFormat::Hayagriva, &[]).unwrap(),
     )
     .unwrap();
 

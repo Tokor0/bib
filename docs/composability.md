@@ -118,7 +118,14 @@ bib find "attention is all you need" --format '{{ id }}\t{{ title }}' \
 
 ```sh
 bib search 'tag:relativity' --keys | xargs bib export -o relativity.yml
+
+# Every command that takes cite keys takes a list of them, so this is also how
+# a whole library is acted on — downloading the documents it is missing, say.
+bib list --keys | xargs bib fetch
 ```
+
+`bib fetch` leaves `fetch.rate_limit` between requests to the same host, so a
+run like that stays inside what arXiv asks of a client.
 
 ## Exit codes
 

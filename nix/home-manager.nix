@@ -88,6 +88,7 @@ in
           folder.template = "{{ date.year }}/{{ citekey }}";
           providers.mailto = "you@example.com";
           providers.arxiv.rate_limit = "3s";
+          export.exclude = [ "abstract" ];
           export.hayagriva.default_path = "bibliography.yml";
           open.pdf = "zathura {{ file }}";
         }

@@ -240,10 +240,28 @@ pub enum OcrMode {
 
 // ------------------------------------------------------------------ export
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ExportConfig {
+    /// Entry fields left out of an exported bibliography.
+    ///
+    /// `abstract` by default. No citation style renders one, so in the file
+    /// Typst reads it is weight and nothing else — for a library of a few dozen
+    /// papers it is most of the bytes, and it turns every regenerated
+    /// bibliography into a diff nobody can read. The abstract stays in the
+    /// library either way: this setting is about the bibliography, not the
+    /// record. Set to `[]` to export everything.
+    pub exclude: Vec<String>,
     pub hayagriva: HayagrivaExportConfig,
+}
+
+impl Default for ExportConfig {
+    fn default() -> Self {
+        Self {
+            exclude: vec!["abstract".to_owned()],
+            hayagriva: HayagrivaExportConfig::default(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -276,6 +294,15 @@ pub struct FetchConfig {
     pub max_size: u64,
     #[serde(with = "humantime_serde")]
     pub timeout: Duration,
+    /// Minimum interval between downloads from the same host.
+    ///
+    /// Fetching a whole library is one client asking arxiv.org for every paper
+    /// in it, back to back; arXiv asks for three seconds between requests and
+    /// blocks callers who do not leave them. The gap is only ever waited when
+    /// two downloads go to the same host in a row, so a single `bib add
+    /// --fetch` pays nothing.
+    #[serde(with = "humantime_serde")]
+    pub rate_limit: Duration,
     /// Which mechanisms may supply a URL, in order.
     pub sources: Vec<String>,
 }
@@ -286,6 +313,7 @@ impl Default for FetchConfig {
             auto: false,
             max_size: 100 * 1024 * 1024,
             timeout: Duration::from_secs(60),
+            rate_limit: Duration::from_secs(3),
             sources: ["arxiv", "openalex", "url"]
                 .iter()
                 .map(|s| (*s).to_owned())
